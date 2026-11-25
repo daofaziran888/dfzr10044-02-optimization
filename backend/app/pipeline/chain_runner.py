@@ -9,7 +9,7 @@
 4. chain_write_commit_conflict: 写入作业←并发提交←冲突重试←乐观锁
 5. chain_partition_evolve_coexist: 分区演化启动→双分区并存→新旧分区消费→切换完成
 6. chain_merge_recovery_compact: 小文件归并→检查点保存→中断恢复→压实确认
-7. chain_stats_column_compact: 统计画像采样→列统计计算→倾斜检测→压实触发
+7. chain_stats_column_compact: 统计画像采样→列统计计算→倾斜检测→压实触发→候选交付
 8. chain_snapshot_timetravel_expire: 快照标记可用→时间旅行回查→过期策略清理
 9. chain_tier_migration_watermark: 存储分层生效→冷热迁移→水位追踪→消费视图发布
 10. chain_retention_audit_reclaim: 保留窗口→审计标记→到期回收→释放字节
@@ -464,6 +464,21 @@ def _step_compact_trigger_by_stats(ctx: ChainContext) -> ChainContext:
     return ctx
 
 
+def _step_compact_candidate_deliver(ctx: ChainContext) -> ChainContext:
+    """交付压实候选：发布一轮画像，按分区聚合行数并冻结可回查文件范围。
+
+    严格超过一半才交付候选，空表没有可执行候选；
+    压实作业后续只引用该轮画像的冻结范围做判定，不再重扫分区文件。
+    """
+    from app.services.stats_profile import StatsProfileService
+    lk = ctx.lake_table
+    profile = StatsProfileService().publish_profile_epoch(lk)
+    ctx.output["profile_epoch"] = profile["epoch_id"]
+    ctx.output["compact_candidates"] = profile["delivered_candidates"]
+    ctx.output["candidate_overwrites"] = profile["overwrites"]
+    return ctx
+
+
 # ============================================================
 # 链路8：快照管理→时间旅行读取→过期策略清理
 # ============================================================
@@ -647,6 +662,7 @@ CHAIN_REGISTRY: dict[str, list[tuple[str, StepFunc]]] = {
         ("stats_profile_sample", _step_stats_profile_sample),
         ("column_stat_compute", _step_column_stat_compute),
         ("compact_trigger_by_stats", _step_compact_trigger_by_stats),
+        ("compact_candidate_deliver", _step_compact_candidate_deliver),
     ],
     "chain_snapshot_timetravel_expire": [
         ("snapshot_mark_available", _step_snapshot_mark_available),

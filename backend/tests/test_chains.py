@@ -131,7 +131,7 @@ class TestChainMergeRecoveryCompact:
 
 
 class TestChainStatsColumnCompact:
-    """测试链路7：统计画像采样→列统计计算→倾斜检测→压实触发。"""
+    """测试链路7：统计画像采样→列统计计算→倾斜检测→压实触发→候选交付。"""
     def test_stats_column_full(self):
         # 先注册一些文件
         lake_store.register_file("test_chain7", "20261101", rows=1000, bytes_=256000)
@@ -147,6 +147,14 @@ class TestChainStatsColumnCompact:
         profile = result.final_output["stats_profile"]
         assert profile["total_rows_estimate"] >= 1550
         assert "column_stat" in result.final_output
+        # 候选交付：倾斜分区产出可核对输入范围的压实候选
+        candidates = result.final_output["compact_candidates"]
+        assert len(candidates) >= 1
+        top = candidates[0]
+        assert top["partition_key"] == "20261101"
+        assert top["file_ids"], "候选必须携带可回查的文件范围"
+        part_rows, total_rows = top["share"].split("/")
+        assert int(part_rows) * 2 > int(total_rows)  # 严格超过一半才交付
 
 
 class TestChainSnapshotTimetravelExpire:

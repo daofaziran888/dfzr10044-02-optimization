@@ -67,6 +67,80 @@ class WatermarkRecord:
     last_advanced_at: float
 
 
+# ----------------------------- 画像轮次与压实候选 -----------------------------
+
+@dataclass
+class ProfileEpoch:
+    """一轮统计画像：按分区聚合行数，并冻结该轮可回查的文件范围。
+
+    压实资格判定只引用某一轮画像冻结的范围与合计，
+    避免压实反复扫描分区文件，也避免拿已经失效的画像做决定。
+    """
+    epoch_id: str
+    lake_table: str
+    total_rows: int
+    partition_rows: dict[str, int]          # 分区 -> 行数（按分区聚合）
+    partition_files: dict[str, list[str]]   # 分区 -> 该轮文件范围（可回查）
+    created_at: float
+
+
+@dataclass
+class CompactCandidate:
+    """压实候选：交付给压实作业的可核对输入范围。
+
+    生命周期：待接单 -> 已接单 -> 已完成
+                            -> 已撤回（接单后合计变化，重算不达门槛）
+                   待接单 -> 已失效（画像更新，候选范围被覆盖）
+    """
+    candidate_id: str
+    lake_table: str
+    partition_key: str
+    epoch_id: str                # 生成候选那一轮的画像
+    file_ids: list[str]          # 生成那一轮的可回查文件范围
+    partition_rows: int
+    total_rows: int
+    status: str                  # 待接单 | 已接单 | 已完成 | 已失效 | 已撤回
+    created_at: float
+    # 接单那一轮冻结的范围：值班员可按此复算执行资格
+    claim_epoch_id: str | None = None
+    claim_file_ids: list[str] = field(default_factory=list)
+    claim_partition_rows: int = 0
+    claim_total_rows: int = 0
+    claimed_at: float | None = None
+    # 失效/撤回原因与覆盖它的新画像
+    invalid_reason: str | None = None
+    superseded_by: str | None = None
+    result_id: str | None = None
+
+
+@dataclass
+class CompactResult:
+    """压实结果：同一候选重复提交只保留一份；boundary 供下游发布对齐。"""
+    result_id: str
+    candidate_id: str
+    lake_table: str
+    partition_key: str
+    input_file_ids: list[str]
+    output_file_id: str
+    output_rows: int
+    boundary_snapshot_id: str    # 已确认的压实边界（快照）
+    confirmed_at: float
+
+
+@dataclass
+class CandidateOverwrite:
+    """候选覆盖变化：画像更新或合计变化导致候选失效/撤回，值班员可见并按新画像派发。"""
+    lake_table: str
+    partition_key: str
+    candidate_id: str
+    old_epoch_id: str
+    new_epoch_id: str
+    old_share: str               # 旧占比，如 "6/10"
+    new_share: str               # 新占比，如 "6/15"
+    reason: str
+    changed_at: float
+
+
 # ----------------------------- 批次数据 -----------------------------
 
 @dataclass
@@ -147,6 +221,18 @@ class LakeStore:
 
         # 归并中断恢复检查点：merge_id -> {partial_file_ids: [...], ...}
         self._merge_checkpoints: dict[str, dict[str, Any]] = {}
+
+        # 画像轮次：lake_table -> list[ProfileEpoch]（按发布序）
+        self._profile_epochs: dict[str, list[ProfileEpoch]] = {}
+
+        # 压实候选：candidate_id -> CompactCandidate
+        self._candidates: dict[str, CompactCandidate] = {}
+
+        # 压实结果（幂等）：candidate_id -> CompactResult
+        self._compact_results: dict[str, CompactResult] = {}
+
+        # 候选覆盖变化流水：值班员可见
+        self._candidate_overwrites: list[CandidateOverwrite] = []
 
     # ---- 文件操作 ----
 
@@ -384,6 +470,100 @@ class LakeStore:
 
     def clear_merge_checkpoint(self, merge_id: str) -> None:
         self._merge_checkpoints.pop(merge_id, None)
+
+    # ---- 画像轮次 ----
+
+    def append_profile_epoch(
+        self,
+        lake_table: str,
+        partition_rows: dict[str, int],
+        partition_files: dict[str, list[str]],
+    ) -> ProfileEpoch:
+        """发布一轮画像：冻结分区行数与文件范围，后续判定引用同一轮。"""
+        chain = self._profile_epochs.setdefault(lake_table, [])
+        epoch = ProfileEpoch(
+            epoch_id=f"epoch-{lake_table}-{len(chain) + 1}",
+            lake_table=lake_table,
+            total_rows=sum(partition_rows.values()),
+            partition_rows=dict(partition_rows),
+            partition_files={pk: list(ids) for pk, ids in partition_files.items()},
+            created_at=time.time(),
+        )
+        chain.append(epoch)
+        return epoch
+
+    def latest_profile_epoch(self, lake_table: str) -> ProfileEpoch | None:
+        chain = self._profile_epochs.get(lake_table, [])
+        return chain[-1] if chain else None
+
+    def get_profile_epoch(self, lake_table: str, epoch_id: str) -> ProfileEpoch | None:
+        for epoch in self._profile_epochs.get(lake_table, []):
+            if epoch.epoch_id == epoch_id:
+                return epoch
+        return None
+
+    # ---- 压实候选 ----
+
+    def add_compact_candidate(
+        self,
+        lake_table: str,
+        partition_key: str,
+        epoch_id: str,
+        file_ids: list[str],
+        partition_rows: int,
+        total_rows: int,
+    ) -> CompactCandidate:
+        candidate_id = f"cand-{lake_table}-{partition_key}-{uuid.uuid4().hex[:6]}"
+        cand = CompactCandidate(
+            candidate_id=candidate_id,
+            lake_table=lake_table,
+            partition_key=partition_key,
+            epoch_id=epoch_id,
+            file_ids=list(file_ids),
+            partition_rows=partition_rows,
+            total_rows=total_rows,
+            status="待接单",
+            created_at=time.time(),
+        )
+        self._candidates[candidate_id] = cand
+        return cand
+
+    def get_candidate(self, candidate_id: str) -> CompactCandidate | None:
+        return self._candidates.get(candidate_id)
+
+    def list_candidates(
+        self, lake_table: str | None = None, status: str | None = None
+    ) -> list[CompactCandidate]:
+        cands = list(self._candidates.values())
+        if lake_table is not None:
+            cands = [c for c in cands if c.lake_table == lake_table]
+        if status is not None:
+            cands = [c for c in cands if c.status == status]
+        return sorted(cands, key=lambda c: c.created_at)
+
+    def record_candidate_overwrite(self, overwrite: CandidateOverwrite) -> None:
+        self._candidate_overwrites.append(overwrite)
+
+    def list_candidate_overwrites(self, lake_table: str | None = None) -> list[CandidateOverwrite]:
+        if lake_table is None:
+            return list(self._candidate_overwrites)
+        return [o for o in self._candidate_overwrites if o.lake_table == lake_table]
+
+    # ---- 压实结果 ----
+
+    def save_compact_result(self, result: CompactResult) -> None:
+        """按候选幂等保存：同一候选重复提交只保留第一份结果。"""
+        self._compact_results.setdefault(result.candidate_id, result)
+
+    def get_compact_result(self, candidate_id: str) -> CompactResult | None:
+        return self._compact_results.get(candidate_id)
+
+    def latest_compact_boundary(self, lake_table: str) -> CompactResult | None:
+        """最近已确认的压实边界：下游发布结果据此标明生效位置。"""
+        results = [r for r in self._compact_results.values() if r.lake_table == lake_table]
+        if not results:
+            return None
+        return max(results, key=lambda r: r.confirmed_at)
 
     # ---- 并发写锁 ----
 
